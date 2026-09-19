@@ -1,4 +1,4 @@
-name: TP2 CI
+name: TP2 CI CD
 
 on:
   push:
@@ -10,14 +10,70 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  ci:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
           cache: maven
+
       - name: Compiler et tester
         run: mvn -B clean verify
+
+      - name: Construire l'image et preparer la livraison
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          IMAGE="ecom:sha-${GITHUB_SHA}"
+          docker build -f Dockerfile.jar -t "$IMAGE" .
+          mkdir dist
+          docker image save "$IMAGE" | gzip > dist/image.tar.gz
+          cp deploy/docker-compose.vps.yml dist/compose.yml
+          cp deploy/receive.sh deploy/activate.sh dist/
+          printf 'APP_IMAGE=%s\nAPP_VERSION=%s\n' "$IMAGE" "$GITHUB_SHA" > dist/release.env
+          (cd dist && sha256sum image.tar.gz compose.yml release.env receive.sh activate.sh > SHA256SUMS)
+
+      - name: Publier l'artefact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: dist/
+          retention-days: 3
+          if-no-files-found: error
+
+  deploy:
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, x64, vps-lab]
+    concurrency:
+      group: deploy-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      SSHPASS: ${{ secrets.VPS_PASSWORD }}
+      VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+    steps:
+      - name: Telecharger l'artefact de la CI
+        uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: dist
+
+      - name: Verifier les sommes de controle
+        run: cd dist && sha256sum -c SHA256SUMS
+
+      - name: Transferer et activer sur le VPS
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > "$RUNNER_TEMP/known_hosts"
+          OPTS="-o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts -o PreferredAuthentications=password -o PubkeyAuthentication=no -o ConnectTimeout=20"
+          REMOTE="/opt/ecom/incoming/${GITHUB_SHA}"
+          sshpass -e ssh $OPTS "$VPS_USER@$VPS_HOST" "rm -rf '$REMOTE' && mkdir -p '$REMOTE'"
+          sshpass -e scp $OPTS dist/* "$VPS_USER@$VPS_HOST:$REMOTE/"
+          sshpass -e ssh $OPTS "$VPS_USER@$VPS_HOST" "bash '$REMOTE/receive.sh' '${GITHUB_SHA}'"
