@@ -10,4 +10,9 @@ class EcomApplicationTests {
 	void contextLoads() {
 	}
 
+	@Test
+	void testVolontairementIncorrect() {
+		org.junit.jupiter.api.Assertions.assertEquals(3, 1 + 1);
+	}
+
 }
